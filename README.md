@@ -1,3 +1,7 @@
+# Introduction
+Project to deploy a python app on an AKS cluster, using Terraform and Ansible for its CI/CD process.
+This can be reutilized for multiple enviroments by defining the corresponding pipelines vars for each deployment
+
 # Pipeline prerequistes 
 ## Commands variables
 - SUBSCRIPTION=cf31015f-3cdf-45e4-96dd-706bebcf84a2
