@@ -1,0 +1,212 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+# Pipeline vars:
+# environment: [dev, qa]
+# aks_sp_id           = __AKS_SP_ID__
+# aks_sp_secret       = __AKS_SP_SECRET__
+# client_id           = __CLIENT_ID__
+# client_secret       = __CLIENT_SECRET__
+# tenant_id           = __TENANT_ID__
+# subscription_id     = __SUBSCRIPTION_ID__
+# access_key          = __STORAGE_ACCOUNT_ACCESS_KEY__
+
+variables:
+  tfResoureGroupName: $(environment)-terraform-backend-rg
+  tfBackendStorageAccountName: $(environment)terraformbackenddemo
+  tfBackendStorageContainerName: terraform-backend-files
+  tfBackendFileName: $(environment).tfstate
+  tfvarsFile: $(environment).tfvars
+  azSubscription: 'tfdemo'
+  cloudProvider: 'azurerm'
+  dockerRegistryServiceConnection: '0ff55a8e-7795-4cc2-8b5d-1969c006051f'
+  imageRepository: 'devops'
+  containerRegistry: 'acrpydemo.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: 'latest'
+  secretName: 'acrsecret'
+  acrName: 'acrpydemo.azurecr.io'
+  vmImageName: 'ubuntu-latest'
+
+trigger:
+- master
+
+resources:
+  - repo: self
+
+
+stages:
+- stage: StaticCodeAnalysis
+  displayName: SonarCloud Static Code Analysis
+  jobs:  
+  - job: StaticCodeAnalysis
+    displayName: 'SonarCloud Static Code Analysis'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: SonarCloudPrepare@1
+      displayName: 'Prepare Analysis'
+      inputs:
+        SonarCloud: 'sonarcloud'
+        organization: 'datatonicdemo'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'datatonicdemo'
+        cliProjectName: 'datatonicdemo'
+        cliSources: '.'
+
+    - task: SonarCloudAnalyze@1
+      displayName: 'Run Analysis'
+
+    - task: SonarCloudPublish@1
+      displayName: 'Publish Results'
+      inputs:
+        pollingTimeoutSec: '300'
+
+- stage: Build
+  displayName: Build python app
+  jobs:  
+  - job: Build
+    displayName: Build python app
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to ACR
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+- stage: InfrastructureDeploy
+  jobs:
+  - job: AksClusterDeployment
+    displayName: 'Terraform Infra Deployment'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    # - task: DownloadSecureFile@1
+    #   displayName: 'Download tfvars'
+    #   name: terraform_vars
+    #   inputs:
+    #     secureFile: 'pipeline-aks.tfvars'
+
+    # - task: CmdLine@2
+    #   displayName: 'Move secured vars to terraform folder'
+    #   inputs:
+    #     script: |
+    #         mv $(terraform_vars.secureFilePath) ./$(environment).tfvars
+    #     workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra/tf-vars'
+
+    - task: replacetokens@3
+      displayName: 'Replace creds on tfvars'
+      inputs:
+        targetFiles: '**/$(tfvarsFile)'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        tokenPrefix: '__'
+        tokenSuffix: '__'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra/tf-vars'
+
+    - task: replacetokens@3
+      displayName: 'Replace creds on for azurerm'
+      inputs:
+        targetFiles: '**/provider.tf'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        tokenPrefix: '__'
+        tokenSuffix: '__'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra'
+
+    - task: CmdLine@2
+      displayName: 'Debug tfvars'
+      inputs:
+        script: |
+          ls -Al
+          cat $(environment).tfvars
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra/tf-vars'
+
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '0.12.7'
+
+    - task: TerraformTaskV1@0
+      displayName: 'Terraform init'
+      inputs:
+        provider: '$(cloudProvider)'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra'
+        backendServiceArm: '$(azSubscription)'
+        backendAzureRmResourceGroupName: '$(tfResoureGroupName)'
+        backendAzureRmStorageAccountName: '$(tfBackendStorageAccountName)'
+        backendAzureRmContainerName: '$(tfBackendStorageContainerName)'
+        backendAzureRmKey: '$(tfBackendFileName)'
+
+    - task: TerraformTaskV1@0
+      displayName: 'Terraform plan'
+      inputs:
+        provider: '$(cloudProvider)'
+        command: 'plan'
+        commandOptions: '-var-file=./tf-vars/$(tfvarsFile) -out="out.plan"'
+        environmentServiceNameAzureRM: '$(azSubscription)'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra'
+
+    - task: CmdLine@2  
+      displayName: 'Terraform apply' 
+      inputs: 
+        script: |
+          terraform apply "out.plan"
+        workingDirectory: '$(System.DefaultWorkingDirectory)/tf-infra'
+
+
+- stage: AppDeploy
+  displayName: Deploy app to k8s cluster
+  jobs:  
+  - job: Deploy
+    displayName: 'Deploy app to k8s cluster'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Kubernetes@1
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: 'dev-aks-cluster-aks-default'
+        command: 'apply'
+        arguments: '-f deployment.yml'
+        secretType: 'dockerRegistry'
+        containerRegistryType: 'Azure Container Registry'
+        azureSubscriptionEndpointForSecrets: 'Visual Studio Professional (cf31015f-3cdf-45e4-96dd-706bebcf84a2)'
+        azureContainerRegistry: '$(acrName)'
+        secretName: '$(secretName)'
+        forceUpdate: true
+        workingDirectory: '$(System.DefaultWorkingDirectory)/app/k8s'
+
+
+- stage: Testing
+  displayName: Post Deployment testing
+  jobs:  
+  - job: Testing
+    displayName: 'Post Deployment testing'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Ansible@0
+      displayName: 'Test python app with Ansible'
+      inputs:
+        ansibleInterface: 'agentMachine'
+        playbookPathOnAgentMachine:  '$(System.DefaultWorkingDirectory)/ansible/post_deployment.yml'
+        inventoriesAgentMachine: 'noInventory'
+        failOnStdErr: false'
+        args: '-v'
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: false
